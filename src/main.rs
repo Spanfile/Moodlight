@@ -1,8 +1,12 @@
 use gethostname::gethostname;
 use log::*;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, Publish, QoS};
-use serde::Deserialize;
-use tokio::{fs::OpenOptions, io::AsyncWriteExt};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use tokio::{
+    fs::{self, OpenOptions},
+    io::AsyncWriteExt,
+};
 
 const ENV_PREFIX: &str = "MOODLIGHT_";
 const MQTT_TOPIC: &str = "moodlight";
@@ -19,6 +23,8 @@ struct Config {
     pin_r: u8,
     pin_g: u8,
     pin_b: u8,
+    #[serde(default = "default_state_file")]
+    state_file: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,7 +39,7 @@ struct ControlMessage {
     on: Option<bool>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct State {
     r: u8,
     g: u8,
@@ -49,6 +55,10 @@ fn default_blaster() -> String {
     String::from("/dev/pi-blaster")
 }
 
+fn default_state_file() -> PathBuf {
+    PathBuf::from("/var/moodlight_state")
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -56,11 +66,7 @@ async fn main() -> anyhow::Result<()> {
     let config = envy::prefixed(ENV_PREFIX).from_env::<Config>()?;
     debug!("{:?}", config);
 
-    let mut mqtt_options = MqttOptions::new(
-        gethostname().to_string_lossy(),
-        &config.broker_host,
-        config.broker_port,
-    );
+    let mut mqtt_options = MqttOptions::new(gethostname().to_string_lossy(), &config.broker_host, config.broker_port);
     mqtt_options
         .set_credentials(&config.broker_username, &config.broker_password)
         .set_keep_alive(10);
@@ -68,8 +74,7 @@ async fn main() -> anyhow::Result<()> {
     let (client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
     client.subscribe(MQTT_TOPIC, QoS::AtLeastOnce).await?;
 
-    let mut state = State::default();
-    info!("Applying default state: {:?}", state);
+    let mut state = State::load(&config.state_file).await?;
     state.apply(&config).await?;
 
     loop {
@@ -90,19 +95,42 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn process_control_message(
-    payload: &[u8],
-    state: &mut State,
-    config: &Config,
-) -> anyhow::Result<()> {
+async fn process_control_message(payload: &[u8], state: &mut State, config: &Config) -> anyhow::Result<()> {
     let msg = serde_json::from_slice::<ControlMessage>(payload)?;
     info!("Received control message: {:?}", msg);
 
     state.edit(msg);
-    state.apply(config).await
+    state.apply(config).await?;
+    state.save(&config.state_file).await
 }
 
 impl State {
+    async fn load(state_file: &Path) -> anyhow::Result<Self> {
+        if state_file.exists() {
+            let state = fs::read_to_string(state_file).await?;
+            let state = serde_json::from_str(&state)?;
+            debug!("Using saved state from file {}: {:?}", state_file.display(), state);
+
+            Ok(state)
+        } else {
+            debug!(
+                "State file {} doesn't exist, returning default state",
+                state_file.display(),
+            );
+
+            Ok(Self::default())
+        }
+    }
+
+    async fn save(&self, state_file: &Path) -> anyhow::Result<()> {
+        let mut file = fs::File::create(state_file).await?;
+        let serialised = serde_json::to_string(self)?;
+        debug!("Saving state to {}: {}", state_file.display(), serialised);
+
+        file.write_all(serialised.as_bytes()).await?;
+        Ok(())
+    }
+
     fn edit(&mut self, msg: ControlMessage) {
         *self = Self {
             r: msg.r.unwrap_or(self.r),
@@ -114,11 +142,7 @@ impl State {
 
     async fn apply(&self, config: &Config) -> anyhow::Result<()> {
         let (r, g, b) = if self.on {
-            (
-                self.r as f32 / 255.0,
-                self.g as f32 / 255.0,
-                self.b as f32 / 255.0,
-            )
+            (self.r as f32 / 255.0, self.g as f32 / 255.0, self.b as f32 / 255.0)
         } else {
             (0.0, 0.0, 0.0)
         };
@@ -133,11 +157,7 @@ impl State {
             b = b
         );
 
-        debug!(
-            "Writing message \"{}\" to {}",
-            &msg[..msg.len() - 1],
-            config.blaster
-        );
+        debug!("Writing message \"{}\" to {}", &msg[..msg.len() - 1], config.blaster);
 
         let mut blaster = OpenOptions::new()
             .read(false)
