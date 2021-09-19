@@ -19,7 +19,7 @@ struct Config {
     #[serde(default = "default_mqtt_port")]
     broker_port: u16,
     #[serde(default = "default_blaster")]
-    blaster: String,
+    blaster: PathBuf,
     pin_r: u8,
     pin_g: u8,
     pin_b: u8,
@@ -51,8 +51,8 @@ fn default_mqtt_port() -> u16 {
     1883
 }
 
-fn default_blaster() -> String {
-    String::from("/dev/pi-blaster")
+fn default_blaster() -> PathBuf {
+    PathBuf::from("/dev/pi-blaster")
 }
 
 fn default_state_file() -> PathBuf {
@@ -157,7 +157,11 @@ impl State {
             b = b
         );
 
-        debug!("Writing message \"{}\" to {}", &msg[..msg.len() - 1], config.blaster);
+        debug!(
+            "Writing message \"{}\" to {}",
+            &msg[..msg.len() - 1],
+            config.blaster.display()
+        );
 
         let mut blaster = OpenOptions::new()
             .read(false)
