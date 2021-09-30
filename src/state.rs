@@ -88,22 +88,29 @@ impl State {
         };
     }
 
+    pub(crate) fn step_hue(&mut self, step: f32) {
+        let hue = (self.colour.hue.to_raw_degrees() + step) % 360.0;
+        self.colour = Hsv::new(hue, 1.0, 1.0);
+    }
+
     pub(crate) async fn apply(&self, config: &Config) -> anyhow::Result<()> {
-        let (r, g, b) = Rgb::from_color(if self.on { self.colour } else { Hsv::default() }).into_components();
+        let hsv = if self.on { self.colour } else { Hsv::default() };
+        let rgb = Rgb::from_color(hsv);
         let msg = format!(
             "{pin_r}={r} {pin_g}={g} {pin_b}={b}\n",
             pin_r = config.pin_r,
             pin_g = config.pin_g,
             pin_b = config.pin_b,
-            r = r,
-            g = g,
-            b = b
+            r = rgb.red,
+            g = rgb.green,
+            b = rgb.blue
         );
 
         debug!(
-            "Writing message \"{}\" to {}",
+            "Applying state: {:?} -> {:?} -> \"{}\"",
+            hsv,
+            rgb,
             &msg[..msg.len() - 1],
-            config.blaster.display()
         );
 
         let mut blaster = OpenOptions::new()

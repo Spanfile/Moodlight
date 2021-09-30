@@ -18,8 +18,8 @@ pub(crate) struct Config {
     pub(crate) pin_b: u8,
     #[serde(default = "default_state_file")]
     pub(crate) state_file: PathBuf,
-    #[serde(default = "default_rainbow_steps")]
-    pub(crate) rainbow_steps: f32,
+    #[serde(default = "default_rainbow_step_duration")]
+    pub(crate) rainbow_step_duration: f32,
     #[serde(default = "default_rainbow_time")]
     pub(crate) rainbow_time: f32,
 }
@@ -44,8 +44,8 @@ fn default_state_file() -> PathBuf {
     PathBuf::from("/var/moodlight_state")
 }
 
-fn default_rainbow_steps() -> f32 {
-    3600.0
+fn default_rainbow_step_duration() -> f32 {
+    0.02
 }
 
 fn default_rainbow_time() -> f32 {

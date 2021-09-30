@@ -6,11 +6,10 @@ use crate::state::{Mode, State};
 use config::Config;
 use gethostname::gethostname;
 use log::*;
-use palette::Hsv;
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, Publish, QoS};
+use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, Publish, QoS};
 use serde::Deserialize;
-use std::{sync::Arc, time::Duration};
-use tokio::{sync::Mutex, time::sleep};
+use std::time::Duration;
+use tokio::time;
 
 const MQTT_TOPIC: &str = "moodlight";
 
@@ -32,25 +31,21 @@ struct ControlMessage {
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-    let config = Arc::new(Config::load()?);
-
-    let mut mqtt_options = MqttOptions::new(gethostname().to_string_lossy(), &config.broker_host, config.broker_port);
-    mqtt_options
-        .set_credentials(&config.broker_username, &config.broker_password)
-        .set_keep_alive(10);
-
-    let (client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
-    client.subscribe(MQTT_TOPIC, QoS::AtLeastOnce).await?;
-
-    let state = State::load(&config.state_file).await?;
+    let config = Config::load()?;
+    let (_c, mut eventloop) = create_mqtt_client(&config).await?;
+    let mut state = State::load(&config.state_file).await?;
     state.apply(&config).await?;
-    let state = Arc::new(Mutex::new(state));
 
-    run_rainbow_thread(Arc::clone(&state), Arc::clone(&config));
+    let (rainbow_duration, rainbow_step_size) = get_rainbow_specs(&config);
+    let mut rainbow_timer = time::interval(rainbow_duration);
 
     loop {
         tokio::select! {
             _ = wait_for_terminate() => break,
+            _ = rainbow_timer.tick(), if state.on && state.mode == Mode::Rainbow => {
+                state.step_hue(rainbow_step_size);
+                state.apply(&config).await?;
+            }
             event = eventloop.poll() => {
                 match event? {
                     Event::Incoming(Packet::ConnAck(ack)) => info!("Connected to broker ({:?})", ack),
@@ -58,7 +53,6 @@ async fn main() -> anyhow::Result<()> {
                     Event::Incoming(Packet::Publish(Publish { payload, .. })) => {
                         debug!("Payload: {:?}", payload);
 
-                        let mut state = state.lock().await;
                         match process_control_message(&payload, &mut state, &config).await {
                             Ok(()) => info!("Control message processed. Current state: {:?}", state),
                             Err(e) => error!("Control message processing failed: {:?}", e),
@@ -72,6 +66,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn create_mqtt_client(config: &Config) -> anyhow::Result<(AsyncClient, EventLoop)> {
+    let mut mqtt_options = MqttOptions::new(gethostname().to_string_lossy(), &config.broker_host, config.broker_port);
+    mqtt_options
+        .set_credentials(&config.broker_username, &config.broker_password)
+        .set_keep_alive(10);
+
+    let (client, eventloop) = AsyncClient::new(mqtt_options, 10);
+    client.subscribe(MQTT_TOPIC, QoS::AtLeastOnce).await?;
+    Ok((client, eventloop))
 }
 
 async fn wait_for_terminate() -> anyhow::Result<()> {
@@ -89,24 +94,13 @@ async fn process_control_message(payload: &[u8], state: &mut State, config: &Con
     state.save(&config.state_file).await
 }
 
-fn run_rainbow_thread(state: Arc<Mutex<State>>, config: Arc<Config>) {
-    tokio::spawn(async move {
-        let step_size = 360.0 / config.rainbow_steps;
-        let step_duration = config.rainbow_time / config.rainbow_steps;
-        let cycle_duration = Duration::from_secs_f32(step_duration);
+fn get_rainbow_specs(config: &Config) -> (Duration, f32) {
+    let steps_in_time = config.rainbow_time / config.rainbow_step_duration;
+    let step_size = 360.0 / steps_in_time;
 
-        loop {
-            sleep(cycle_duration).await;
-
-            let mut state = state.lock().await;
-            if state.on && state.mode == Mode::Rainbow {
-                let hue = (state.colour.hue.to_raw_degrees() + step_size) % 360.0;
-                state.colour = Hsv::new(hue, 1.0, 1.0);
-
-                if let Err(e) = state.apply(&config).await {
-                    error!("Applying new state failed: {}", e);
-                }
-            }
-        }
-    });
+    debug!(
+        "Rainbow: {} steps (fixed length {}s) in {}s -> {} step size",
+        steps_in_time, config.rainbow_step_duration, config.rainbow_time, step_size
+    );
+    (Duration::from_secs_f32(config.rainbow_step_duration), step_size)
 }
