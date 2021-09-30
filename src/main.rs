@@ -1,5 +1,6 @@
 use gethostname::gethostname;
 use log::*;
+use palette::{encoding, rgb::Rgb, FromColor, Hsv, RgbHue};
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, Publish, QoS};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -30,20 +31,18 @@ struct Config {
 #[derive(Debug, Deserialize)]
 struct ControlMessage {
     #[serde(default)]
-    r: Option<u8>,
+    h: Option<f32>,
     #[serde(default)]
-    g: Option<u8>,
+    s: Option<f32>,
     #[serde(default)]
-    b: Option<u8>,
+    v: Option<f32>,
     #[serde(default)]
     on: Option<bool>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct State {
-    r: u8,
-    g: u8,
-    b: u8,
+    colour: Hsv<encoding::Srgb, f32>,
     on: bool,
 }
 
@@ -108,8 +107,17 @@ impl State {
     async fn load(state_file: &Path) -> anyhow::Result<Self> {
         if state_file.exists() {
             let state = fs::read_to_string(state_file).await?;
-            let state = serde_json::from_str(&state)?;
-            debug!("Using saved state from file {}: {:?}", state_file.display(), state);
+            let state = match serde_json::from_str(&state) {
+                Ok(s) => {
+                    debug!("Using saved state from file {}: {:?}", state_file.display(), state);
+                    s
+                }
+                Err(e) => {
+                    warn!("State failed to load: {}", e);
+                    warn!("Using default state");
+                    Self::default()
+                }
+            };
 
             Ok(state)
         } else {
@@ -132,21 +140,19 @@ impl State {
     }
 
     fn edit(&mut self, msg: ControlMessage) {
+        let (h, s, v) = self.colour.into_components();
         *self = Self {
-            r: msg.r.unwrap_or(self.r),
-            g: msg.g.unwrap_or(self.g),
-            b: msg.b.unwrap_or(self.b),
+            colour: Hsv::from_components((
+                msg.h.map(RgbHue::from_degrees).unwrap_or(h),
+                msg.s.unwrap_or(s),
+                msg.v.unwrap_or(v),
+            )),
             on: msg.on.unwrap_or(self.on),
         };
     }
 
     async fn apply(&self, config: &Config) -> anyhow::Result<()> {
-        let (r, g, b) = if self.on {
-            (self.r as f32 / 255.0, self.g as f32 / 255.0, self.b as f32 / 255.0)
-        } else {
-            (0.0, 0.0, 0.0)
-        };
-
+        let (r, g, b) = Rgb::from_color(if self.on { self.colour } else { Hsv::default() }).into_components();
         let msg = format!(
             "{pin_r}={r} {pin_g}={g} {pin_b}={b}\n",
             pin_r = config.pin_r,
