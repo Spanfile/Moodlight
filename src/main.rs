@@ -1,12 +1,20 @@
+#![feature(derive_default_enum)]
+
 use gethostname::gethostname;
 use log::*;
 use palette::{encoding, rgb::Rgb, FromColor, Hsv, RgbHue};
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, Publish, QoS};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
+    sync::Mutex,
+    time::sleep,
 };
 
 const ENV_PREFIX: &str = "MOODLIGHT_";
@@ -26,6 +34,10 @@ struct Config {
     pin_b: u8,
     #[serde(default = "default_state_file")]
     state_file: PathBuf,
+    #[serde(default = "default_rainbow_steps")]
+    rainbow_steps: f32,
+    #[serde(default = "default_rainbow_time")]
+    rainbow_time: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,12 +50,8 @@ struct ControlMessage {
     v: Option<f32>,
     #[serde(default)]
     on: Option<bool>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct State {
-    colour: Hsv<encoding::Srgb, f32>,
-    on: bool,
+    #[serde(default)]
+    mode: Option<Mode>,
 }
 
 fn default_mqtt_port() -> u16 {
@@ -58,11 +66,34 @@ fn default_state_file() -> PathBuf {
     PathBuf::from("/var/moodlight_state")
 }
 
+fn default_rainbow_steps() -> f32 {
+    3600.0
+}
+
+fn default_rainbow_time() -> f32 {
+    60.0
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum Mode {
+    #[default]
+    Static,
+    Rainbow,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct State {
+    colour: Hsv<encoding::Srgb, f32>,
+    mode: Mode,
+    on: bool,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-    let config = envy::prefixed(ENV_PREFIX).from_env::<Config>()?;
+    let config = Arc::new(envy::prefixed(ENV_PREFIX).from_env::<Config>()?);
     debug!("{:?}", config);
 
     let mut mqtt_options = MqttOptions::new(gethostname().to_string_lossy(), &config.broker_host, config.broker_port);
@@ -73,25 +104,63 @@ async fn main() -> anyhow::Result<()> {
     let (client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
     client.subscribe(MQTT_TOPIC, QoS::AtLeastOnce).await?;
 
-    let mut state = State::load(&config.state_file).await?;
+    let state = State::load(&config.state_file).await?;
     state.apply(&config).await?;
+    let state = Arc::new(Mutex::new(state));
 
-    loop {
-        match eventloop.poll().await? {
-            Event::Incoming(Packet::ConnAck(ack)) => info!("Connected to broker ({:?})", ack),
-            Event::Incoming(Packet::SubAck(ack)) => info!("Subscribed to topic ({:?})", ack),
-            Event::Incoming(Packet::Publish(Publish { payload, .. })) => {
-                debug!("Payload: {:?}", payload);
+    let s = Arc::clone(&state);
+    let c = Arc::clone(&config);
+    let rainbow_thread = tokio::spawn(async move {
+        let step_size = 360.0 / c.rainbow_steps;
+        let step_duration = c.rainbow_time / c.rainbow_steps;
+        let cycle_duration = Duration::from_secs_f32(step_duration);
+        let mut current_hue = 0f32;
 
-                match process_control_message(&payload, &mut state, &config).await {
-                    Ok(()) => info!("Control message processed. Current state: {:?}", state),
-                    Err(e) => error!("Control message processing failed: {:?}", e),
+        loop {
+            sleep(cycle_duration).await;
+
+            let mut state = s.lock().await;
+            if state.on && state.mode == Mode::Rainbow {
+                current_hue = (current_hue + step_size) % 360.0;
+                state.colour = Hsv::new(current_hue, 1.0, 1.0);
+                if let Err(e) = state.apply(&c).await {
+                    error!("Applying new state failed: {}", e);
                 }
             }
+        }
+    });
 
-            e => debug!("Unhandled event: {:?}", e),
+    loop {
+        tokio::select! {
+            _ = wait_for_terminate() => break,
+            event = eventloop.poll() => {
+                match event? {
+                    Event::Incoming(Packet::ConnAck(ack)) => info!("Connected to broker ({:?})", ack),
+                    Event::Incoming(Packet::SubAck(ack)) => info!("Subscribed to topic ({:?})", ack),
+                    Event::Incoming(Packet::Publish(Publish { payload, .. })) => {
+                        debug!("Payload: {:?}", payload);
+
+                        let mut state = state.lock().await;
+                        match process_control_message(&payload, &mut state, &config).await {
+                            Ok(()) => info!("Control message processed. Current state: {:?}", state),
+                            Err(e) => error!("Control message processing failed: {:?}", e),
+                        }
+                    }
+
+                    e => debug!("Unhandled event: {:?}", e),
+                }
+            }
         }
     }
+
+    rainbow_thread.abort();
+    Ok(())
+}
+
+async fn wait_for_terminate() -> anyhow::Result<()> {
+    tokio::signal::ctrl_c().await?;
+    debug!("Received SIGTERM");
+    Ok(())
 }
 
 async fn process_control_message(payload: &[u8], state: &mut State, config: &Config) -> anyhow::Result<()> {
@@ -140,14 +209,21 @@ impl State {
     }
 
     fn edit(&mut self, msg: ControlMessage) {
-        let (h, s, v) = self.colour.into_components();
         *self = Self {
-            colour: Hsv::from_components((
-                msg.h.map(RgbHue::from_degrees).unwrap_or(h),
-                msg.s.unwrap_or(s),
-                msg.v.unwrap_or(v),
-            )),
+            colour: match (msg.mode, self.mode) {
+                // update the colour only if the current mode is static, or it's being set to static
+                (Some(Mode::Static), _) | (_, Mode::Static) => {
+                    let (h, s, v) = self.colour.into_components();
+                    Hsv::from_components((
+                        msg.h.map(RgbHue::from_degrees).unwrap_or(h),
+                        msg.s.unwrap_or(s),
+                        msg.v.unwrap_or(v),
+                    ))
+                }
+                _ => self.colour,
+            },
             on: msg.on.unwrap_or(self.on),
+            mode: msg.mode.unwrap_or(self.mode),
         };
     }
 
