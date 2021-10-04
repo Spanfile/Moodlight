@@ -9,7 +9,7 @@ use log::*;
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, Publish, QoS};
 use serde::Deserialize;
 use std::time::Duration;
-use tokio::time;
+use tokio::time::{self, MissedTickBehavior};
 
 const MQTT_TOPIC: &str = "moodlight";
 
@@ -38,6 +38,9 @@ async fn main() -> anyhow::Result<()> {
 
     let (rainbow_duration, rainbow_step_size) = get_rainbow_specs(&config);
     let mut rainbow_timer = time::interval(rainbow_duration);
+    // set the missed tick behavior to Delay so when the rainbow timer should tick but doesn't, because the light is off
+    // or set to Static, any missed ticks are "ignored" and it'll start ticking regularly when active again
+    rainbow_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
