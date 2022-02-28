@@ -8,10 +8,9 @@ use tokio::{
     io::AsyncWriteExt,
 };
 
-#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Mode {
-    #[default]
     Static,
     Rainbow,
 }
@@ -27,8 +26,8 @@ impl Default for State {
     fn default() -> Self {
         Self {
             colour: Hsv::new(0.0, 1.0, 1.0),
-            mode: Default::default(),
-            on: Default::default(),
+            mode: Mode::Static,
+            on: false,
         }
     }
 }

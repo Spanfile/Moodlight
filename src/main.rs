@@ -1,4 +1,3 @@
-#![feature(derive_default_enum)]
 mod config;
 mod state;
 
@@ -50,10 +49,10 @@ async fn main() -> anyhow::Result<()> {
                 state.apply(&config).await?;
             }
             event = eventloop.poll() => {
-                match event? {
-                    Event::Incoming(Packet::ConnAck(ack)) => info!("Connected to broker ({:?})", ack),
-                    Event::Incoming(Packet::SubAck(ack)) => info!("Subscribed to topic ({:?})", ack),
-                    Event::Incoming(Packet::Publish(Publish { payload, .. })) => {
+                match event {
+                    Ok(Event::Incoming(Packet::ConnAck(ack))) => info!("Connected to broker ({:?})", ack),
+                    Ok(Event::Incoming(Packet::SubAck(ack))) => info!("Subscribed to topic ({:?})", ack),
+                    Ok(Event::Incoming(Packet::Publish(Publish { payload, .. }))) => {
                         debug!("Payload: {:?}", payload);
 
                         match process_control_message(&payload, &mut state, &config).await {
@@ -62,7 +61,8 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    e => debug!("Unhandled event: {:?}", e),
+                    Ok(e) => debug!("Unhandled event: {:?}", e),
+                    Err(e) => error!("MQTT client returned error: {:?}", e),
                 }
             }
         }
@@ -75,7 +75,7 @@ async fn create_mqtt_client(config: &Config) -> anyhow::Result<(AsyncClient, Eve
     let mut mqtt_options = MqttOptions::new(gethostname().to_string_lossy(), &config.broker_host, config.broker_port);
     mqtt_options
         .set_credentials(&config.broker_username, &config.broker_password)
-        .set_keep_alive(10);
+        .set_keep_alive(Duration::from_secs(10));
 
     let (client, eventloop) = AsyncClient::new(mqtt_options, 10);
     client.subscribe(MQTT_TOPIC, QoS::AtLeastOnce).await?;
