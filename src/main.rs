@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     let config = Config::load()?;
-    let (_c, mut eventloop) = create_mqtt_client(&config).await?;
+    let (client, mut eventloop) = create_mqtt_client(&config).await?;
     let mut state = State::load(&config.state_file).await?;
     state.apply(&config).await?;
 
@@ -50,7 +50,10 @@ async fn main() -> anyhow::Result<()> {
             }
             event = eventloop.poll() => {
                 match event {
-                    Ok(Event::Incoming(Packet::ConnAck(ack))) => info!("Connected to broker ({:?})", ack),
+                    Ok(Event::Incoming(Packet::ConnAck(ack))) => {
+                        info!("Connected to broker ({:?}), subscribing to moodlight topic...", ack);
+                        client.subscribe(MQTT_TOPIC, QoS::AtLeastOnce).await?;
+                    }
                     Ok(Event::Incoming(Packet::SubAck(ack))) => info!("Subscribed to topic ({:?})", ack),
                     Ok(Event::Incoming(Packet::Publish(Publish { payload, .. }))) => {
                         debug!("Payload: {:?}", payload);
@@ -78,7 +81,6 @@ async fn create_mqtt_client(config: &Config) -> anyhow::Result<(AsyncClient, Eve
         .set_keep_alive(Duration::from_secs(10));
 
     let (client, eventloop) = AsyncClient::new(mqtt_options, 10);
-    client.subscribe(MQTT_TOPIC, QoS::AtLeastOnce).await?;
     Ok((client, eventloop))
 }
 
