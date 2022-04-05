@@ -8,24 +8,32 @@ use tokio::{
     io::AsyncWriteExt,
 };
 
+// both in seconds
+const MIN_RAINBOW_SPEED: f32 = 1.0;
+const MAX_RAINBOW_SPEED: f32 = 60.0;
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum Mode {
+pub enum Mode {
     Static,
     Rainbow,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct State {
-    pub(crate) colour: Hsv<encoding::Srgb, f32>,
-    pub(crate) mode: Mode,
-    pub(crate) on: bool,
+pub struct State {
+    pub colour: Hsv<encoding::Srgb, f32>,
+    pub rainbow_brightness: f32,
+    pub rainbow_speed: f32,
+    pub mode: Mode,
+    pub on: bool,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
             colour: Hsv::new(0.0, 1.0, 1.0),
+            rainbow_brightness: 1.0,
+            rainbow_speed: MAX_RAINBOW_SPEED,
             mode: Mode::Static,
             on: false,
         }
@@ -33,7 +41,7 @@ impl Default for State {
 }
 
 impl State {
-    pub(crate) async fn load(state_file: &Path) -> anyhow::Result<Self> {
+    pub async fn load(state_file: &Path) -> anyhow::Result<Self> {
         if state_file.exists() {
             let state = fs::read_to_string(state_file).await?;
             let state = match serde_json::from_str(&state) {
@@ -59,7 +67,7 @@ impl State {
         }
     }
 
-    pub(crate) async fn save(&self, state_file: &Path) -> anyhow::Result<()> {
+    pub async fn save(&self, state_file: &Path) -> anyhow::Result<()> {
         let mut file = fs::File::create(state_file).await?;
         let serialised = serde_json::to_string(self)?;
         debug!("Saving state to {}: {}", state_file.display(), serialised);
@@ -68,7 +76,7 @@ impl State {
         Ok(())
     }
 
-    pub(crate) fn edit(&mut self, msg: ControlMessage) {
+    pub fn edit(&mut self, msg: ControlMessage) {
         *self = Self {
             colour: match (self.mode, msg.mode) {
                 // update the colour only if the current mode is static, or it's being set to static
@@ -82,17 +90,32 @@ impl State {
                 }
                 _ => self.colour,
             },
+            rainbow_brightness: msg
+                .rainbow_brightness
+                .map(|b| b as f32 / 255.0)
+                .unwrap_or(self.rainbow_brightness),
+            rainbow_speed: msg
+                .rainbow_speed
+                .map(|s| ((s as f32 / 60.0) * MAX_RAINBOW_SPEED).clamp(MIN_RAINBOW_SPEED, MAX_RAINBOW_SPEED))
+                .unwrap_or(self.rainbow_speed),
             on: msg.on.unwrap_or(self.on),
             mode: msg.mode.unwrap_or(self.mode),
         };
     }
 
-    pub(crate) fn step_hue(&mut self, step: f32) {
-        let hue = (self.colour.hue.to_raw_degrees() + step) % 360.0;
-        self.colour = Hsv::new(hue, 1.0, 1.0);
+    pub fn step_hue(&mut self, step_duration: f32) {
+        // the rainbow speed is a measure of how long it should take to go through all the colours, i.e. go through the
+        // 360 degrees of the colour wheel. by knowing how often the steps are taken, calculate how long each step
+        // should be to achieve the correct time
+
+        let steps_in_time = self.rainbow_speed / step_duration;
+        let step_size = 360.0 / steps_in_time;
+
+        let hue = (self.colour.hue.to_raw_degrees() + step_size) % 360.0;
+        self.colour = Hsv::new(hue, 1.0, self.rainbow_brightness);
     }
 
-    pub(crate) async fn apply(&self, config: &Config) -> anyhow::Result<()> {
+    pub async fn apply(&self, config: &Config) -> anyhow::Result<()> {
         let hsv = if self.on { self.colour } else { Hsv::default() };
         let rgb = Rgb::from_color(hsv);
         let msg = format!(

@@ -1,3 +1,6 @@
+// because you're an idiot and never remember it, the correct target to build for so this runs on a Pi Zero W is
+// arm-unknown-linux-gnueabihf
+
 mod config;
 mod state;
 
@@ -13,13 +16,17 @@ use tokio::time::{self, MissedTickBehavior};
 const MQTT_TOPIC: &str = "moodlight";
 
 #[derive(Debug, Deserialize)]
-struct ControlMessage {
+pub struct ControlMessage {
     #[serde(default)]
     h: Option<f32>,
     #[serde(default)]
     s: Option<f32>,
     #[serde(default)]
     v: Option<f32>,
+    #[serde(default)]
+    rainbow_brightness: Option<u8>,
+    #[serde(default)]
+    rainbow_speed: Option<f32>,
     #[serde(default)]
     on: Option<bool>,
     #[serde(default)]
@@ -35,17 +42,19 @@ async fn main() -> anyhow::Result<()> {
     let mut state = State::load(&config.state_file).await?;
     state.apply(&config).await?;
 
-    let (rainbow_duration, rainbow_step_size) = get_rainbow_specs(&config);
-    let mut rainbow_timer = time::interval(rainbow_duration);
+    let mut rainbow_timer = time::interval(Duration::from_secs_f32(config.rainbow_step_duration));
     // set the missed tick behavior to Delay so when the rainbow timer should tick but doesn't, because the light is off
     // or set to Static, any missed ticks are "ignored" and it'll start ticking regularly when active again
     rainbow_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
-            _ = wait_for_terminate() => break,
+            _ = wait_for_terminate() => {
+                state.save(&config.state_file).await?;
+                break
+            }
             _ = rainbow_timer.tick(), if state.on && state.mode == Mode::Rainbow => {
-                state.step_hue(rainbow_step_size);
+                state.step_hue(config.rainbow_step_duration);
                 state.apply(&config).await?;
             }
             event = eventloop.poll() => {
@@ -97,15 +106,4 @@ async fn process_control_message(payload: &[u8], state: &mut State, config: &Con
     state.edit(msg);
     state.apply(config).await?;
     state.save(&config.state_file).await
-}
-
-fn get_rainbow_specs(config: &Config) -> (Duration, f32) {
-    let steps_in_time = config.rainbow_time / config.rainbow_step_duration;
-    let step_size = 360.0 / steps_in_time;
-
-    debug!(
-        "Rainbow: {} steps (fixed length {}s) in {}s -> {} step size",
-        steps_in_time, config.rainbow_step_duration, config.rainbow_time, step_size
-    );
-    (Duration::from_secs_f32(config.rainbow_step_duration), step_size)
 }
