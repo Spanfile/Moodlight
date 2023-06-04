@@ -22,8 +22,8 @@ pub struct Config {
     pub pin_r: u8,
     pub pin_g: u8,
     pub pin_b: u8,
-    #[serde(default = "default_rainbow_step_duration")]
-    pub rainbow_step_duration: f32,
+    #[serde(default = "default_step_duration")]
+    pub step_duration: f32,
 
     #[serde(default = "default_home_assistant_topic")]
     pub home_assistant_topic: String,
@@ -77,7 +77,7 @@ fn default_blaster() -> PathBuf {
     PathBuf::from("/dev/pi-blaster")
 }
 
-fn default_rainbow_step_duration() -> f32 {
+fn default_step_duration() -> f32 {
     0.02
 }
 
