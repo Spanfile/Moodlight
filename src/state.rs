@@ -8,9 +8,16 @@ use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
 use crate::{Color, Config, ControlMessage, OnState};
 
-pub const MIN_RAINBOW_SPEED_S: f32 = 1.0;
-pub const MAX_RAINBOW_SPEED_S: f32 = 60.0;
-const TRANSITION_LENGTH_S: f32 = 0.75;
+const MIN_RAINBOW_SPEED_S: f32 = 1.0;
+const MAX_RAINBOW_SPEED_S: f32 = 60.0;
+const MAX_RAINBOW_SPEED_SETTING: f32 = 100.0; // the min is always assumed to be 0
+
+// since the minimum speed setting means maximum speed time, calculate a slope to map the range
+// 0..MAX_RAINBOW_SPEED_SETTING to MAX_RAINBOW_SPEED_S..MIN_RAINBOW_SPEED_S (note the inversed min and max). since the
+// ranges are "inversed", the slope is negative
+const RAINBOW_SPEED_SLOPE: f32 = (MIN_RAINBOW_SPEED_S - MAX_RAINBOW_SPEED_S) / MAX_RAINBOW_SPEED_SETTING;
+
+const TRANSITION_LENGTH_S: f32 = 0.5;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -99,7 +106,7 @@ impl State {
             brightness: msg.brightness.unwrap_or(self.brightness),
             rainbow_speed: msg
                 .rainbow_speed
-                .map(|s| (s / 60.0 * MAX_RAINBOW_SPEED_S).clamp(MIN_RAINBOW_SPEED_S, MAX_RAINBOW_SPEED_S))
+                .map(|s| s.clamp(0., MAX_RAINBOW_SPEED_SETTING))
                 .unwrap_or(self.rainbow_speed),
             state: msg.state.unwrap_or(self.state),
             mode: msg.mode.unwrap_or(self.mode),
@@ -121,14 +128,20 @@ impl State {
 
     pub fn step_hue(&mut self, step_duration: f32) {
         // the rainbow speed is a measure of how long it should take to go through all the colours, i.e. go through the
-        // 360 degrees of the colour wheel. by knowing how often the steps are taken, calculate how long each step
-        // should be to achieve the correct time
+        // 360 degrees of the colour wheel. the value is between 0 and 100 where 0 = slowest, i.e. longest time and 100
+        // = fastest, i.e. quickest time. the slope constant provides this mapping. by knowing how often the steps are
+        // taken, calculate how long each step should be to achieve the correct time
 
-        let steps_in_time = self.rainbow_speed / step_duration;
+        // the maximum speed is the start of the range. since the slope is negative, this will decrease the time as the
+        // speed increases
+        let rainbow_time = MAX_RAINBOW_SPEED_S + RAINBOW_SPEED_SLOPE * self.rainbow_speed;
+        let steps_in_time = rainbow_time / step_duration;
         let step_size = 360.0 / steps_in_time;
 
-        let h = (self.color.h + step_size) % 360.0;
-        self.color = Color { h, ..self.color };
+        self.color = Color {
+            h: (self.color.h + step_size) % 360.0,
+            ..self.color
+        };
     }
 
     pub async fn apply(&mut self, config: &Config) -> anyhow::Result<()> {

@@ -64,7 +64,8 @@ async fn main() -> anyhow::Result<()> {
     let (client, mut eventloop) = create_mqtt_client(&config).await?;
 
     let mut state = State::default();
-    state.apply(&config).await?;
+    // don't apply the default state, instead wait for the stored state in MQTT to be read and applied
+    // state.apply(&config).await?;
 
     send_home_assistant_discovery(&config, &client).await?;
 
@@ -139,12 +140,16 @@ async fn main() -> anyhow::Result<()> {
 
                     Err(e) => {
                         error!("MQTT client returned error: {e:?}");
-                        break;
+                        // TODO: check what caused the error and break only if it's something unrecoverable
+                        // break;
                     }
                 }
             }
         }
     }
+
+    info!("Shutting down");
+    state.apply(&config).await?;
 
     Ok(())
 }
