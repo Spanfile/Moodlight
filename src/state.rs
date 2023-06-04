@@ -1,105 +1,102 @@
-use crate::{Config, ControlMessage};
 use log::*;
-use palette::{encoding, rgb::Rgb, FromColor, Hsv, RgbHue};
-use serde::{Deserialize, Serialize};
-use std::path::Path;
-use tokio::{
-    fs::{self, OpenOptions},
-    io::AsyncWriteExt,
-};
+use palette::{encoding, rgb::Rgb, FromColor, Hsv};
+use serde::{de::Visitor, Deserialize, Serialize};
+use tokio::{fs::OpenOptions, io::AsyncWriteExt};
+
+use crate::{Color, Config, ControlMessage, OnState};
 
 // both in seconds
-const MIN_RAINBOW_SPEED: f32 = 1.0;
-const MAX_RAINBOW_SPEED: f32 = 60.0;
+pub const MIN_RAINBOW_SPEED: f32 = 1.0;
+pub const MAX_RAINBOW_SPEED: f32 = 60.0;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
 pub enum Mode {
     Static,
     Rainbow,
 }
 
+#[derive(Debug)]
+struct HsColorMode;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct State {
-    pub colour: Hsv<encoding::Srgb, f32>,
-    pub rainbow_brightness: f32,
+    pub color: Color,
+    pub brightness: u8,
     pub rainbow_speed: f32,
     pub mode: Mode,
-    pub on: bool,
+    pub state: OnState,
+
+    color_mode: HsColorMode,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
-            colour: Hsv::new(0.0, 1.0, 1.0),
-            rainbow_brightness: 1.0,
+            color: Color { h: 360.0, s: 100.0 },
+            brightness: u8::MAX,
             rainbow_speed: MAX_RAINBOW_SPEED,
             mode: Mode::Static,
-            on: false,
+            state: OnState::Off,
+            color_mode: HsColorMode,
         }
     }
 }
 
-impl State {
-    pub async fn load(state_file: &Path) -> anyhow::Result<Self> {
-        if state_file.exists() {
-            let state = fs::read_to_string(state_file).await?;
-            let state = match serde_json::from_str(&state) {
-                Ok(s) => {
-                    debug!("Using saved state from file {}: {:?}", state_file.display(), state);
-                    s
-                }
-                Err(e) => {
-                    warn!("State failed to load: {}", e);
-                    warn!("Using default state");
-                    Self::default()
-                }
-            };
+impl Serialize for HsColorMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str("hs")
+    }
+}
 
-            Ok(state)
-        } else {
-            debug!(
-                "State file {} doesn't exist, returning default state",
-                state_file.display(),
-            );
+impl<'de> Deserialize<'de> for HsColorMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct HsColorModeVisitor;
 
-            Ok(Self::default())
+        impl<'de> Visitor<'de> for HsColorModeVisitor {
+            type Value = HsColorMode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("the string 'hs'")
+            }
+
+            fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v == "hs" {
+                    Ok(HsColorMode)
+                } else {
+                    Err(serde::de::Error::invalid_value(serde::de::Unexpected::Str(v), &self))
+                }
+            }
         }
+
+        deserializer.deserialize_str(HsColorModeVisitor)
     }
+}
 
-    pub async fn save(&self, state_file: &Path) -> anyhow::Result<()> {
-        let mut file = fs::File::create(state_file).await?;
-        let serialised = serde_json::to_string(self)?;
-        debug!("Saving state to {}: {}", state_file.display(), serialised);
-
-        file.write_all(serialised.as_bytes()).await?;
-        Ok(())
-    }
-
+impl State {
     pub fn edit(&mut self, msg: ControlMessage) {
         *self = Self {
-            colour: match (self.mode, msg.mode) {
+            color: match (self.mode, msg.mode) {
                 // update the colour only if the current mode is static, or it's being set to static
-                (Mode::Static, _) | (_, Some(Mode::Static)) => {
-                    let (h, s, v) = self.colour.into_components();
-                    Hsv::from_components((
-                        msg.h.map(RgbHue::from_degrees).unwrap_or(h),
-                        msg.s.unwrap_or(s),
-                        msg.v.unwrap_or(v),
-                    ))
-                }
-                _ => self.colour,
+                (Mode::Static, _) | (_, Some(Mode::Static)) => msg.color.unwrap_or(self.color),
+                _ => self.color,
             },
-            rainbow_brightness: msg
-                .rainbow_brightness
-                .map(|b| b as f32 / 255.0)
-                .unwrap_or(self.rainbow_brightness),
+            brightness: msg.brightness.unwrap_or(self.brightness),
             rainbow_speed: msg
                 .rainbow_speed
-                .map(|s| ((s as f32 / 60.0) * MAX_RAINBOW_SPEED).clamp(MIN_RAINBOW_SPEED, MAX_RAINBOW_SPEED))
+                .map(|s| (s / 60.0 * MAX_RAINBOW_SPEED).clamp(MIN_RAINBOW_SPEED, MAX_RAINBOW_SPEED))
                 .unwrap_or(self.rainbow_speed),
-            on: msg.on.unwrap_or(self.on),
+            state: msg.state.unwrap_or(self.state),
             mode: msg.mode.unwrap_or(self.mode),
+            color_mode: HsColorMode,
         };
     }
 
@@ -111,13 +108,19 @@ impl State {
         let steps_in_time = self.rainbow_speed / step_duration;
         let step_size = 360.0 / steps_in_time;
 
-        let hue = (self.colour.hue.to_raw_degrees() + step_size) % 360.0;
-        self.colour = Hsv::new(hue, 1.0, self.rainbow_brightness);
+        let h = (self.color.h + step_size) % 360.0;
+        self.color = Color { h, ..self.color };
     }
 
     pub async fn apply(&self, config: &Config) -> anyhow::Result<()> {
-        let hsv = if self.on { self.colour } else { Hsv::default() };
+        let hsv = if self.state == OnState::On {
+            Hsv::<encoding::Srgb, f32>::new(self.color.h, self.color.s / 100.0, self.brightness as f32 / 255.0)
+        } else {
+            Hsv::default()
+        };
+
         let rgb = Rgb::from_color(hsv);
+
         let msg = format!(
             "{pin_r}={r} {pin_g}={g} {pin_b}={b}\n",
             pin_r = config.pin_r,
@@ -128,12 +131,7 @@ impl State {
             b = rgb.blue
         );
 
-        debug!(
-            "Applying state: {:?} -> {:?} -> \"{}\"",
-            hsv,
-            rgb,
-            &msg[..msg.len() - 1],
-        );
+        debug!("Applying state: {hsv:?} -> {rgb:?} -> \"{}\"", &msg[..msg.len() - 1],);
 
         let mut blaster = OpenOptions::new()
             .read(false)

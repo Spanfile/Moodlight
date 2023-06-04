@@ -1,85 +1,163 @@
-// because you're an idiot and never remember it, the correct target to build for so this runs on a Pi Zero W is
-// arm-unknown-linux-gnueabihf
+// because you're an idiot and never remember it, the magic incantation so this runs on a Pi Zero W is
+// cross build --target=arm-unknown-linux-gnueabihf --release
 
 mod config;
+mod hass;
 mod state;
 
-use crate::state::{Mode, State};
+use std::time::Duration;
+
 use config::Config;
 use gethostname::gethostname;
 use log::*;
-use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, Publish, QoS};
-use serde::Deserialize;
-use std::time::Duration;
+use rumqttc::v5::{
+    mqttbytes::{
+        v5::{Filter, Packet, Publish},
+        QoS,
+    },
+    AsyncClient, Event, EventLoop, MqttOptions,
+};
+use serde::{Deserialize, Serialize};
 use tokio::time::{self, MissedTickBehavior};
 
-const MQTT_TOPIC: &str = "moodlight";
+use crate::{
+    hass::{HomeAssistantLightConfig, HomeAssistantNumberConfig, HomeAssistantSelectConfig},
+    state::{Mode, State},
+};
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Copy, Clone)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum OnState {
+    On,
+    Off,
+}
+
+#[derive(Debug, Serialize, Deserialize, Copy, Clone)]
+pub struct Color {
+    pub h: f32,
+    pub s: f32,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ControlMessage {
     #[serde(default)]
-    h: Option<f32>,
+    color: Option<Color>,
     #[serde(default)]
-    s: Option<f32>,
-    #[serde(default)]
-    v: Option<f32>,
-    #[serde(default)]
-    rainbow_brightness: Option<u8>,
+    brightness: Option<u8>,
     #[serde(default)]
     rainbow_speed: Option<f32>,
     #[serde(default)]
-    on: Option<bool>,
+    state: Option<OnState>,
     #[serde(default)]
     mode: Option<Mode>,
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    if cfg!(debug_assertions) {
+        dotenv::dotenv()?;
+    }
+
     env_logger::init();
 
     let config = Config::load()?;
     let (client, mut eventloop) = create_mqtt_client(&config).await?;
-    let mut state = State::load(&config.state_file).await?;
+
+    let mut state = State::default();
     state.apply(&config).await?;
+
+    send_home_assistant_discovery(&config, &client).await?;
 
     let mut rainbow_timer = time::interval(Duration::from_secs_f32(config.rainbow_step_duration));
     // set the missed tick behavior to Delay so when the rainbow timer should tick but doesn't, because the light is off
     // or set to Static, any missed ticks are "ignored" and it'll start ticking regularly when active again
     rainbow_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+    let own_topic = config.own_topic();
+    let command_topic = config.command_topic();
+    let state_topic = config.state_topic();
+
     loop {
         tokio::select! {
             _ = wait_for_terminate() => {
-                state.save(&config.state_file).await?;
+                // state.save(&config.state_file).await?;
                 break
             }
-            _ = rainbow_timer.tick(), if state.on && state.mode == Mode::Rainbow => {
+
+            _ = rainbow_timer.tick(), if state.state == OnState::On && state.mode == Mode::Rainbow => {
                 state.step_hue(config.rainbow_step_duration);
                 state.apply(&config).await?;
             }
+
             event = eventloop.poll() => {
                 match event {
                     Ok(Event::Incoming(Packet::ConnAck(ack))) => {
-                        info!("Connected to broker ({:?}), subscribing to moodlight topic...", ack);
-                        client.subscribe(MQTT_TOPIC, QoS::AtLeastOnce).await?;
-                    }
-                    Ok(Event::Incoming(Packet::SubAck(ack))) => info!("Subscribed to topic ({:?})", ack),
-                    Ok(Event::Incoming(Packet::Publish(Publish { payload, .. }))) => {
-                        debug!("Payload: {:?}", payload);
+                        info!("Connected to broker ({ack:?}), subscribing to own topics under '{own_topic}'");
 
-                        match process_control_message(&payload, &mut state, &config).await {
-                            Ok(()) => info!("Control message processed. Current state: {:?}", state),
-                            Err(e) => error!("Control message processing failed: {:?}", e),
+                        client
+                            .subscribe_many([
+                                Filter {
+                                    path: command_topic.clone(),
+                                    qos: QoS::AtLeastOnce,
+                                    nolocal: true,
+                                    ..Default::default()
+                                },
+                                Filter {
+                                    path: state_topic.clone(),
+                                    qos: QoS::AtLeastOnce,
+                                    nolocal: true,
+                                    ..Default::default()
+                                },
+                            ])
+                            .await?;
+                    }
+
+                    Ok(Event::Incoming(Packet::SubAck(ack))) => info!("Subscribed to topic ({ack:?})"),
+
+                    Ok(Event::Incoming(Packet::Publish(Publish { payload, topic, .. }))) => {
+                        let topic = String::from_utf8(topic.to_vec()).expect("non-UTF8 topic");
+                        debug!("On {topic}: {payload:?}");
+
+                        if topic == command_topic {
+                            if let Err(e) = process_command_message(&payload, &mut state, &config).await {
+                                error!("Command message processing failed: {e}");
+                            } else {
+                                info!("Command message processed. Current state: {state:?}");
+                                info!("Saving state to MQTT");
+
+                                let state_json = serde_json::to_vec(&state).expect("failed to serialise state");
+                                if let Err(e) = client.publish(state_topic.clone(), QoS::AtLeastOnce, true, state_json).await {
+                                    error!("Failed to publish current state: {e}");
+                                }
+                            }
+                        } else if topic == state_topic {
+                            if let Err(e) = process_state_message(&payload, &mut state, &config).await {
+                                error!("State message processing failed: {e}");
+                            }
+                        } else {
+                            warn!("Received message in unknown topic: {topic}");
                         }
                     }
 
-                    Ok(e) => debug!("Unhandled event: {:?}", e),
-                    Err(e) => error!("MQTT client returned error: {:?}", e),
+                    Ok(_e) => {
+                        // debug!("Unhandled event: {_e:?}");
+                    }
+
+                    Err(e) => {
+                        error!("MQTT client returned error: {e:?}");
+                        break;
+                    }
                 }
             }
         }
     }
 
+    Ok(())
+}
+
+async fn wait_for_terminate() -> anyhow::Result<()> {
+    tokio::signal::ctrl_c().await?;
+    debug!("Received SIGTERM");
     Ok(())
 }
 
@@ -93,17 +171,67 @@ async fn create_mqtt_client(config: &Config) -> anyhow::Result<(AsyncClient, Eve
     Ok((client, eventloop))
 }
 
-async fn wait_for_terminate() -> anyhow::Result<()> {
-    tokio::signal::ctrl_c().await?;
-    debug!("Received SIGTERM");
+async fn send_home_assistant_discovery(config: &Config, client: &AsyncClient) -> anyhow::Result<()> {
+    let light_config = HomeAssistantLightConfig::new(config);
+    let select_config = HomeAssistantSelectConfig::new(config);
+    let number_config = HomeAssistantNumberConfig::new(config);
+
+    debug!("{light_config:?}");
+    debug!("{select_config:?}");
+    debug!("{number_config:?}");
+
+    let light_config_json = serde_json::to_string(&light_config).expect("failed to serialize light config");
+    let select_config_json = serde_json::to_string(&select_config).expect("failed to serialize select config");
+    let number_config_json = serde_json::to_string(&number_config).expect("failed to serialize number config");
+
+    info!("Sending Home Assistant MQTT discovery messages");
+
+    client
+        .publish(
+            config.home_assistant_light_topic(),
+            QoS::AtLeastOnce,
+            true,
+            light_config_json,
+        )
+        .await?;
+
+    client
+        .publish(
+            config.home_assistant_select_topic(),
+            QoS::AtLeastOnce,
+            true,
+            select_config_json,
+        )
+        .await?;
+
+    client
+        .publish(
+            config.home_assistant_number_topic(),
+            QoS::AtLeastOnce,
+            true,
+            number_config_json,
+        )
+        .await?;
+
     Ok(())
 }
 
-async fn process_control_message(payload: &[u8], state: &mut State, config: &Config) -> anyhow::Result<()> {
+async fn process_command_message(payload: &[u8], state: &mut State, config: &Config) -> anyhow::Result<()> {
     let msg = serde_json::from_slice::<ControlMessage>(payload)?;
-    info!("Received control message: {:?}", msg);
+    info!("Received command message: {msg:?}",);
 
     state.edit(msg);
     state.apply(config).await?;
-    state.save(&config.state_file).await
+
+    Ok(())
+}
+
+async fn process_state_message(payload: &[u8], state: &mut State, config: &Config) -> anyhow::Result<()> {
+    let new_state = serde_json::from_slice::<State>(payload)?;
+    info!("Received existing state: {new_state:?}");
+
+    *state = new_state;
+    state.apply(config).await?;
+
+    Ok(())
 }

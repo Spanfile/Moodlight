@@ -1,22 +1,22 @@
 [Unit]
 Description=Moodlight
-After=pi-blaster.service
+After=pi-blaster.service network.target
 Wants=pi-blaster.service
 
 [Service]
 Type=simple
 Restart=always
 RestartSec=1
+ExecStart=/usr/local/bin/moodlight
 
 Environment=RUST_LOG=info
+Environment=MOODLIGHT_NAME=
 Environment=MOODLIGHT_BROKER_HOST=
 Environment=MOODLIGHT_BROKER_USERNAME=
 Environment=MOODLIGHT_BROKER_PASSWORD=
 Environment=MOODLIGHT_PIN_R=
 Environment=MOODLIGHT_PIN_G=
 Environment=MOODLIGHT_PIN_B=
-
-ExecStart=/usr/local/bin/moodlight
 
 [Install]
 WantedBy=multi-user.target
