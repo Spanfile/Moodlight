@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::config::Config;
+use crate::{config::Config, state::MAX_RAINBOW_SPEED_SETTING};
 
 #[derive(Debug, Serialize)]
 struct HomeAssistantDevice {
@@ -108,7 +108,7 @@ impl HomeAssistantNumberConfig {
             },
 
             min: 0.,
-            max: 100.,
+            max: MAX_RAINBOW_SPEED_SETTING,
             mode: "slider",
             command_template: "{\"rainbow_speed\": {{ value }}}",
             value_template: "{{ value_json.rainbow_speed }}",

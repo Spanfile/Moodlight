@@ -367,6 +367,7 @@ dependencies = [
  "dotenv",
  "env_logger",
  "envy",
+ "futures",
  "gethostname",
  "log",
  "palette",

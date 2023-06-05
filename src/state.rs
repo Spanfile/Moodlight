@@ -10,7 +10,7 @@ use crate::{Color, Config, ControlMessage, OnState};
 
 const MIN_RAINBOW_SPEED_S: f32 = 1.0;
 const MAX_RAINBOW_SPEED_S: f32 = 60.0;
-const MAX_RAINBOW_SPEED_SETTING: f32 = 100.0; // the min is always assumed to be 0
+pub const MAX_RAINBOW_SPEED_SETTING: f32 = 100.0; // the min is always assumed to be 0
 
 // since the minimum speed setting means maximum speed time, calculate a slope to map the range
 // 0..MAX_RAINBOW_SPEED_SETTING to MAX_RAINBOW_SPEED_S..MIN_RAINBOW_SPEED_S (note the inversed min and max). since the

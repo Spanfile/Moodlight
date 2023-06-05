@@ -5,9 +5,8 @@ mod config;
 mod hass;
 mod state;
 
-use std::time::Duration;
+use std::{task::Poll, time::Duration};
 
-use config::Config;
 use gethostname::gethostname;
 use log::*;
 use rumqttc::v5::{
@@ -18,9 +17,13 @@ use rumqttc::v5::{
     AsyncClient, Event, EventLoop, MqttOptions,
 };
 use serde::{Deserialize, Serialize};
-use tokio::time::{self, MissedTickBehavior};
+use tokio::{
+    signal::unix::{signal, SignalKind},
+    time::{self, MissedTickBehavior},
+};
 
 use crate::{
+    config::Config,
     hass::{HomeAssistantLightConfig, HomeAssistantNumberConfig, HomeAssistantSelectConfig},
     state::{Mode, State},
 };
@@ -64,27 +67,23 @@ async fn main() -> anyhow::Result<()> {
     let (client, mut eventloop) = create_mqtt_client(&config).await?;
 
     let mut state = State::default();
-    // don't apply the default state, instead wait for the stored state in MQTT to be read and applied
+    // don't apply the default state, instead let the stored state in MQTT to be read and applied later
     // state.apply(&config).await?;
-
-    send_home_assistant_discovery(&config, &client).await?;
 
     let mut rainbow_timer = time::interval(Duration::from_secs_f32(config.step_duration));
     // set the missed tick behavior to Delay so when the rainbow timer should tick but doesn't, because the light is off
     // or set to Static, any missed ticks are "ignored" and it'll start ticking regularly when active again
     rainbow_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    let own_topic = config.own_topic();
+    send_home_assistant_discovery(&config, &client).await?;
+    subscribe_to_own_topics(&config, &client).await?;
+
     let command_topic = config.command_topic();
     let state_topic = config.state_topic();
 
     loop {
         tokio::select! {
-            _ = wait_for_terminate() => {
-                // state.save(&config.state_file).await?;
-                break
-            }
-
+            _ = wait_for_terminate() => break,
             _ = rainbow_timer.tick(), if state.state == OnState::On && state.mode == Mode::Rainbow => {
                 state.step_hue(config.step_duration);
                 state.apply(&config).await?;
@@ -92,27 +91,7 @@ async fn main() -> anyhow::Result<()> {
 
             event = eventloop.poll() => {
                 match event {
-                    Ok(Event::Incoming(Packet::ConnAck(ack))) => {
-                        info!("Connected to broker ({ack:?}), subscribing to own topics under '{own_topic}'");
-
-                        client
-                            .subscribe_many([
-                                Filter {
-                                    path: command_topic.clone(),
-                                    qos: QoS::AtLeastOnce,
-                                    nolocal: true,
-                                    ..Default::default()
-                                },
-                                Filter {
-                                    path: state_topic.clone(),
-                                    qos: QoS::AtLeastOnce,
-                                    nolocal: true,
-                                    ..Default::default()
-                                },
-                            ])
-                            .await?;
-                    }
-
+                    Ok(Event::Incoming(Packet::ConnAck(ack))) => info!("Connected to broker ({ack:?})"),
                     Ok(Event::Incoming(Packet::SubAck(ack))) => info!("Subscribed to topic ({ack:?})"),
 
                     Ok(Event::Incoming(Packet::Publish(Publish { payload, topic, .. }))) => {
@@ -128,6 +107,11 @@ async fn main() -> anyhow::Result<()> {
                         } else if topic == state_topic {
                             if let Err(e) = process_state_message(&payload, &mut state, &config).await {
                                 error!("State message processing failed: {e}");
+                            }
+
+                            info!("Received initial state, unsubscribing from state topic");
+                            if let Err(e) = client.unsubscribe(&state_topic).await {
+                                error!("Failed to unsubscribe from state topic: {e}");
                             }
                         } else {
                             warn!("Received message in unknown topic: {topic}");
@@ -148,15 +132,38 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    info!("Shutting down");
-    state.apply(&config).await?;
+    info!("Shutting down; saving state to MQTT");
 
+    if let Err(e) = state.publish_to_mqtt(&client, &state_topic).await {
+        error!("Failed to save state to MQTT: {e}");
+    } else {
+        // the publish doesn't actually go out until we poll the event loop enough times to empty the send queue
+
+        loop {
+            let eventloop_poll = eventloop.poll();
+            futures::pin_mut!(eventloop_poll);
+
+            match futures::poll!(eventloop_poll) {
+                Poll::Ready(res) => debug!("{res:?}"),
+                Poll::Pending => break,
+            }
+        }
+    }
+
+    debug!("Shutting down");
     Ok(())
 }
 
 async fn wait_for_terminate() -> anyhow::Result<()> {
-    tokio::signal::ctrl_c().await?;
-    debug!("Received SIGTERM");
+    let mut sigterm = signal(SignalKind::terminate()).unwrap();
+    let mut sigint = signal(SignalKind::interrupt()).unwrap();
+
+    tokio::select! {
+        _ = sigterm.recv() => (),
+        _ = sigint.recv() => (),
+    }
+
+    debug!("Received termination signal");
     Ok(())
 }
 
@@ -210,6 +217,28 @@ async fn send_home_assistant_discovery(config: &Config, client: &AsyncClient) ->
             true,
             number_config_json,
         )
+        .await?;
+
+    Ok(())
+}
+
+async fn subscribe_to_own_topics(config: &Config, client: &AsyncClient) -> anyhow::Result<()> {
+    info!("Subscribing to own topics under {}", config.own_topic());
+    client
+        .subscribe_many([
+            Filter {
+                path: config.command_topic(),
+                qos: QoS::AtLeastOnce,
+                nolocal: true,
+                ..Default::default()
+            },
+            Filter {
+                path: config.state_topic(),
+                qos: QoS::AtLeastOnce,
+                nolocal: true,
+                ..Default::default()
+            },
+        ])
         .await?;
 
     Ok(())
