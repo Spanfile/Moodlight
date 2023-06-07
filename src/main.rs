@@ -67,6 +67,9 @@ async fn main() -> anyhow::Result<()> {
     let (client, mut eventloop) = create_mqtt_client(&config).await?;
 
     let mut state = State::default();
+    let mut initial_state_received = false;
+    let mut hass_discovery_sent = false;
+
     // don't apply the default state, instead let the stored state in MQTT to be read and applied later
     // state.apply(&config).await?;
 
@@ -74,9 +77,6 @@ async fn main() -> anyhow::Result<()> {
     // set the missed tick behavior to Delay so when the rainbow timer should tick but doesn't, because the light is off
     // or set to Static, any missed ticks are "ignored" and it'll start ticking regularly when active again
     rainbow_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-    send_home_assistant_discovery(&config, &client).await?;
-    subscribe_to_own_topics(&config, &client).await?;
 
     let command_topic = config.command_topic();
     let state_topic = config.state_topic();
@@ -91,7 +91,18 @@ async fn main() -> anyhow::Result<()> {
 
             event = eventloop.poll() => {
                 match event {
-                    Ok(Event::Incoming(Packet::ConnAck(ack))) => info!("Connected to broker ({ack:?})"),
+                    Ok(Event::Incoming(Packet::ConnAck(ack))) => {
+                        info!("Connected to broker ({ack:?})");
+
+                        if !hass_discovery_sent {
+                            send_home_assistant_discovery(&config, &client).await?;
+                            hass_discovery_sent = true;
+                        }
+
+                        // subscribe to the state topic only if we haven't yet received the initial state from there
+                        subscribe_to_own_topics(&config, &client, !initial_state_received).await?;
+                    }
+
                     Ok(Event::Incoming(Packet::SubAck(ack))) => info!("Subscribed to topic ({ack:?})"),
 
                     Ok(Event::Incoming(Packet::Publish(Publish { payload, topic, .. }))) => {
@@ -109,7 +120,8 @@ async fn main() -> anyhow::Result<()> {
                                 error!("State message processing failed: {e}");
                             }
 
-                            info!("Received initial state, unsubscribing from state topic");
+                            initial_state_received = true;
+
                             if let Err(e) = client.unsubscribe(&state_topic).await {
                                 error!("Failed to unsubscribe from state topic: {e}");
                             }
@@ -222,25 +234,30 @@ async fn send_home_assistant_discovery(config: &Config, client: &AsyncClient) ->
     Ok(())
 }
 
-async fn subscribe_to_own_topics(config: &Config, client: &AsyncClient) -> anyhow::Result<()> {
+async fn subscribe_to_own_topics(
+    config: &Config,
+    client: &AsyncClient,
+    include_state_topic: bool,
+) -> anyhow::Result<()> {
     info!("Subscribing to own topics under {}", config.own_topic());
-    client
-        .subscribe_many([
-            Filter {
-                path: config.command_topic(),
-                qos: QoS::AtLeastOnce,
-                nolocal: true,
-                ..Default::default()
-            },
-            Filter {
-                path: config.state_topic(),
-                qos: QoS::AtLeastOnce,
-                nolocal: true,
-                ..Default::default()
-            },
-        ])
-        .await?;
 
+    let mut topics = vec![Filter {
+        path: config.command_topic(),
+        qos: QoS::AtLeastOnce,
+        nolocal: true,
+        ..Default::default()
+    }];
+
+    if include_state_topic {
+        topics.push(Filter {
+            path: config.state_topic(),
+            qos: QoS::AtLeastOnce,
+            nolocal: true,
+            ..Default::default()
+        });
+    }
+
+    client.subscribe_many(topics).await?;
     Ok(())
 }
 
@@ -267,7 +284,7 @@ async fn process_command_message(
 
 async fn process_state_message(payload: &[u8], state: &mut State, config: &Config) -> anyhow::Result<()> {
     let new_state = serde_json::from_slice::<State>(payload)?;
-    info!("Received existing state: {new_state:?}");
+    info!("Received initial state: {new_state:?}");
 
     *state = new_state;
     state.apply(config).await?;
