@@ -14,7 +14,7 @@ pub struct Config {
     pub mqtt_topic: String,
     pub broker_username: String,
     pub broker_password: String,
-    pub broker_host: String,
+    pub broker_url: String,
     #[serde(default = "default_mqtt_port")]
     pub broker_port: u16,
     #[serde(default = "default_blaster")]

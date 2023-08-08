@@ -7,7 +7,6 @@ mod state;
 
 use std::{task::Poll, time::Duration};
 
-use gethostname::gethostname;
 use log::*;
 use rumqttc::v5::{
     mqttbytes::{
@@ -180,7 +179,7 @@ async fn wait_for_terminate() -> anyhow::Result<()> {
 }
 
 async fn create_mqtt_client(config: &Config) -> anyhow::Result<(AsyncClient, EventLoop)> {
-    let mut mqtt_options = MqttOptions::new(gethostname().to_string_lossy(), &config.broker_host, config.broker_port);
+    let mut mqtt_options = MqttOptions::parse_url(&config.broker_url)?;
     mqtt_options
         .set_credentials(&config.broker_username, &config.broker_password)
         .set_keep_alive(Duration::from_secs(10));
