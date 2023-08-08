@@ -10,7 +10,7 @@ struct HomeAssistantDevice {
 
 #[derive(Debug, Serialize)]
 pub struct HomeAssistantLightConfig {
-    name: String,
+    name: Option<()>,
     unique_id: String,
     command_topic: String,
     state_topic: String,
@@ -24,7 +24,7 @@ pub struct HomeAssistantLightConfig {
 
 #[derive(Debug, Serialize)]
 pub struct HomeAssistantSelectConfig {
-    name: String,
+    name: &'static str,
     unique_id: String,
     command_topic: String,
     state_topic: String,
@@ -37,7 +37,7 @@ pub struct HomeAssistantSelectConfig {
 
 #[derive(Debug, Serialize)]
 pub struct HomeAssistantNumberConfig {
-    name: String,
+    name: &'static str,
     unique_id: String,
     command_topic: String,
     state_topic: String,
@@ -55,8 +55,8 @@ impl HomeAssistantLightConfig {
         let unique_id = config.unique_id();
 
         Self {
-            name: format!("{} moodlight", config.name),
-            unique_id: unique_id.clone(),
+            name: None,
+            unique_id: format!("{}_light", unique_id),
             command_topic: config.command_topic(),
             state_topic: config.state_topic(),
             device: HomeAssistantDevice {
@@ -77,8 +77,8 @@ impl HomeAssistantSelectConfig {
         let unique_id = config.unique_id();
 
         Self {
-            name: format!("{} moodlight mode", config.name),
-            unique_id: unique_id.clone(),
+            name: "Mode",
+            unique_id: format!("{}_mode_select", unique_id),
             command_topic: config.command_topic(),
             state_topic: config.state_topic(),
             device: HomeAssistantDevice {
@@ -98,8 +98,8 @@ impl HomeAssistantNumberConfig {
         let unique_id = config.unique_id();
 
         Self {
-            name: format!("{} moodlight rainbow speed", config.name),
-            unique_id: unique_id.clone(),
+            name: "Rainbow speed",
+            unique_id: format!("{}_rainbow_speed", unique_id),
             command_topic: config.command_topic(),
             state_topic: config.state_topic(),
             device: HomeAssistantDevice {
